@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+# magic — plan to code. Checks the plan, then runs it headless inside a worktree:
+#   check → build → test → docs → confirm ×2 → commit 1 → review → commit 2 → beep → report
+# Two sessions: build, test, docs and the confirms share one conversation; review
+# (and the PR body) is a fresh one. Confirm is a boolean "is it done?" to the same
+# session, no proofs rerun; two DONE in a row end it, CONTINUE resets the count.
+# The check gate is the only human gate: once running, the agent decides inside
+# the plan's scope and logs assumptions in changes.md. Exits early only when the
+# agent declares the plan impossible or MAGIC_MAX_ROUNDS confirms pass.
+# Timings: every row also lands in $MAGIC_HOME/<repo>/<branch>/rows.tsv (default
+# ~/.magic), appended across runs.
+# Usage: magic <plan dir | plan.md> [--claude|--codex] [--pr] [--dev] [--force] [--branch <name>] [--no-beep]
+#   The check gate always runs: a plan that is not READY_TO_EXECUTE, has open
+#   questions, or lacks a Blocks table exits here, with the open questions
+#   stored in <plan dir>/questions.md; otherwise the run starts at once.
+#   --pr  also posts a two-line "Contributed with Magic" comment on the PR when
+#         it is opened (not on edits).
+#   Branch: the plan's **Branch:** line, else --branch, else <type>/<ticket>-<slug> with the
+#   conventional type (feat|fix|docs|refactor|chore|test) inferred from the plan title.
+#   Engine: --claude (default) runs every step with `claude -p`; --codex runs every
+#   step with `codex exec`, inlining the skill files as the prompt. magic-claude and
+#   magic-codex are shorthands.
+#   Rerun-safe: steps already recorded in changes.md are skipped; --force reruns them.
+#   --pr  when the review layer is green: push and open a DRAFT PR whose title
+#         carries the status circle and whose body ends with the self-review.
+#   --dev (or MAGIC_DEV=1) for testing magic itself: everything runs, including
+#         local commits and the PR body, but nothing leaves the machine: no push,
+#         no gh. The agents never could; their tools have no gh or network.
+set -euo pipefail
+
+main() {
+
+ENGINE="${MAGIC_ENGINE:-claude}"
+CLAUDE_MODEL="${MAGIC_MODEL:-claude-fable-5-1}"
+CLAUDE_FALLBACK="claude-opus-5-5"
+CODEX_MODEL="${MAGIC_CODEX_MODEL:-}"
+MAX_ROUNDS="${MAGIC_MAX_ROUNDS:-15}"
+CTX_LIMIT="${MAGIC_CTX_LIMIT:-180000}"
+SELF="${BASH_SOURCE[0]}"   # npm installs the binary as a relative symlink; walk it back to the package
+while [ -L "$SELF" ]; do d="$(cd "$(dirname "$SELF")" && pwd)"; SELF="$(readlink "$SELF")"; [[ "$SELF" = /* ]] || SELF="$d/$SELF"; done
+PKG="$(cd "$(dirname "$SELF")/.." && pwd)"
+SKILLS="$PKG/skills"
+USAGE="usage: magic <plan dir | plan.md> [--claude|--codex] [--pr] [--dev] [--force] [--branch <name>] [--no-beep]"
+HAMMER='You run non-interactively inside magic. The human handed this plan over
+and will not answer questions mid-run. An open question: decide inside the
+plan'"'"'s scope, record the decision under "## Assumptions" in changes.md, keep
+going. Never invent a migration, env var, config key, or external contract the
+plan does not name; use what exists. Never fix failures in files the plan does
+not touch: note them in changes.md and move on. No git operations.
+End your reply with exactly one of these lines:
+  MAGIC: DONE
+  MAGIC: IMPOSSIBLE — <one line: why no in-scope work can move this plan forward>'
+CONFIRM='Quick check in this same session, no proofs to rerun: is every
+requirement R1..Rn and the Done-when of the plan fulfilled by the diff as it
+stands? Yes → reply with exactly: MAGIC: DONE
+No → fix the gap inside the plan'"'"'s scope, append a "## Verify" entry to
+changes.md, then end with: MAGIC: CONTINUE — <gap>'
+VERDICT=""
+SESSION=""; SESSION_N=0; CTX=0
+TOOLS="Read,Edit,Write,Glob,Grep,Bash(yarn *),Bash(npm *),Bash(npx *),Bash(git diff*),Bash(git status*),Bash(git log*)"
+BEEP=1; PR=0; FORCE=0; BRANCH_FLAG=""; DEV="${MAGIC_DEV:-0}"
+
+model_ok() {  # one tiny call; the CLI returns rc 0 even for an unknown model, so read the result
+  claude -p 'Reply with the single word ok.' --model "$1" --output-format json --max-turns 1 2>/dev/null |
+    jq -e '.is_error == false and (.result | length) > 0' >/dev/null
+}
+die() { printf '\e[31m❌ magic: %s\e[0m\n' "$*" >&2; exit 1; }
+say() { printf '\e[36m%s %s\e[0m\n' "$(icon "$1")" "$*"; }
+icon() {  # step name → emoji; anything else gets the wand
+  case "$1" in
+    build*) printf '🔨';; test*) printf '🧪';; docs*) printf '📚';;
+    confirm*) printf '🔍';; commit*) printf '📦';; review*) printf '👀';; pr*) printf '🚀';;
+    worktree*) printf '🌳';; executable) printf '✅';; push*) printf '🚀';; *) printf '✨';;
+  esac
+}
+SPIN_PID=""
+spin() {  # label → redraws the last line with a wheel and elapsed time until spin_stop
+  [ -t 1 ] || return 0
+  local f=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) label="$1" t0=$SECONDS i=0
+  ( while :; do
+      printf '\r\e[2K\e[36m%s %s  %s\e[0m' "${f[i++ % 10]}" "$label" "$(fmt_t $((SECONDS - t0)))"
+      sleep 0.1
+    done ) &
+  SPIN_PID=$!
+}
+spin_stop() {
+  [ -n "$SPIN_PID" ] || return 0
+  { kill "$SPIN_PID" && wait "$SPIN_PID"; } 2>/dev/null || true
+  SPIN_PID=""; [ -t 1 ] && printf '\r\e[2K'
+}
+trap spin_stop EXIT
+fmt_t() { printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); }
+stage() {  # name [suffix] → blank line + "[STAGE n/N] icon name suffix"
+  local n; case "$1" in build) n=1;; test) n=2;; docs) n=3;; confirm) n=4;; review) n=5;; pr) n=6;; esac
+  printf '\n\e[1m[STAGE %s/%s]\e[0m %s %s%s\n' "$n" "$((5 + PR))" "$(icon "$1")" "$1" "${2:+ · $2}"
+}
+step_cost() { tail -n1 "$ROWS" | cut -f3 | grep -oE '\$[0-9]+\.[0-9]+' || true; }
+total_cost() { printf '$%.2f' "$(grep -oE '\$[0-9]+\.[0-9]+' "$ROWS" | tr -d '$' | paste -sd+ - | bc 2>/dev/null || echo 0)"; }
+beep() {  # 1 → done, 0 → stopped
+  [ "$BEEP" -eq 1 ] || return 0
+  [ "$1" -eq 1 ] && local snd=Glass || local snd=Basso
+  afplay "/System/Library/Sounds/$snd.aiff" 2>/dev/null || printf '\a'
+}
+
+PLAN_ARG=""; want_branch=0
+for a in "$@"; do
+  if [ "$want_branch" -eq 1 ]; then BRANCH_FLAG="$a"; want_branch=0; continue; fi
+  case "$a" in
+    --branch) want_branch=1;;
+    --help|-h) echo "$USAGE"; exit 0;;
+    --version|-V) echo "magic $(jq -r .version "$PKG/package.json")"; exit 0;;
+    --no-beep) BEEP=0;; --pr) PR=1;; --dev) DEV=1;; --force) FORCE=1;; --claude) ENGINE=claude;; --codex) ENGINE=codex;;
+    check) ;;   # old spelling; the check always runs now
+    -*) die "unknown flag $a";;
+    *) [ -z "$PLAN_ARG" ] || die "one plan at a time"; PLAN_ARG="$a";;
+  esac
+done
+[ -n "$PLAN_ARG" ] || die "$USAGE"
+
+case "$ENGINE" in
+  claude) MODEL="$CLAUDE_MODEL"; command -v claude >/dev/null || die "claude CLI not found"
+          model_ok "$MODEL" || { say "🔁 $MODEL unavailable, using $CLAUDE_FALLBACK"; MODEL="$CLAUDE_FALLBACK"; };;
+  codex)  MODEL="${CODEX_MODEL:-codex default}"; command -v codex >/dev/null || die "codex CLI not found";;
+  *) die "unknown engine $ENGINE";;
+esac
+PLAN_DIR="$(cd "$([ -d "$PLAN_ARG" ] && echo "$PLAN_ARG" || dirname "$PLAN_ARG")" && pwd)"
+PLAN="$PLAN_DIR/plan.md"
+[ -f "$PLAN" ] || die "no plan.md in $PLAN_DIR"
+LINEAR_URL="$(grep -oE 'https://linear\.app/[A-Za-z0-9_-]+/issue/[A-Z]+-[0-9]+' "$PLAN" | head -1 || true)"
+
+ROOT="$(git -C "$PLAN_DIR" rev-parse --show-toplevel)"
+BASE=main; git -C "$ROOT" show-ref -q refs/remotes/origin/develop && BASE=develop
+PLAN_BASE="$(basename "$PLAN_DIR")"
+NAME="$(echo "$PLAN_BASE" | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-//' | tr '[:upper:]' '[:lower:]')"
+BRANCH="$(sed -nE 's/^\*\*Branch:\*\* *`?([^` ]+)`?.*/\1/p' "$PLAN" | head -1)"
+case "$BRANCH" in ""|none*|"none yet") BRANCH="$BRANCH_FLAG";; esac
+if [ -z "$BRANCH" ]; then
+  TITLE_LINE="$(sed -n '1p' "$PLAN" | tr '[:upper:]' '[:lower:]')"
+  case "$TITLE_LINE" in
+    *fix*|*bug*|*broken*|*regression*|*incident*) TYPE=fix;;
+    *doc*|*readme*)                                 TYPE=docs;;
+    *refactor*|*cleanup*|*clean-up*|*rename*|*dedup*) TYPE=refactor;;
+    *test*|*spec*coverage*)                         TYPE=test;;
+    *chore*|*deps*|*dependenc*|*ci*|*tooling*)      TYPE=chore;;
+    *)                                              TYPE=feat;;
+  esac
+  TICKET="$(grep -oE '\b[A-Z]{2,}-[0-9]+\b' "$PLAN" | head -1 | tr '[:upper:]' '[:lower:]' || true)"
+  case "$NAME" in "$TICKET"*|"") BRANCH="$TYPE/$NAME";; *) BRANCH="$TYPE/${TICKET:+$TICKET-}$NAME";; esac
+else
+  TYPE="${BRANCH%%/*}"; case "$TYPE" in feat|fix|docs|refactor|chore|test|perf|ci|build|style) ;; *) TYPE=feat;; esac
+fi
+
+{
+  STATUS="$(sed -nE 's/^\*\*Status:\*\* *`?([A-Z_]+)`?.*/\1/p' "$PLAN" | head -1)"
+  OPEN="$(awk '/^## (Open|Blocking) questions/{on=1; next} /^## /{on=0} on' "$PLAN" |
+          grep -vE '^[[:space:]]*$|^[[:space:]]*~~|^[[:space:]]*-?[[:space:]]*none[.[:space:]]*$' || true)"
+  grep -q '^## Blocks' "$PLAN" && BLOCKS=yes || BLOCKS=missing
+  SLOW="$(awk '/^## Test blocks/{on=1; next} /^## /{on=0} on' "$PLAN" |
+          grep -oiE '[a-z0-9_./-]*(integration|e2e)[a-z0-9_./-]*|testcontainers|docker' | sort -u | paste -sd' ' - || true)"
+  MODE="$(sed -nE 's/^\*\*Mode:\*\* *`?([A-Za-z]+)`?.*/\1/p' "$PLAN" | head -1)"
+  OPEN_N="$([ -z "$OPEN" ] && echo 0 || printf '%s\n' "$OPEN" | wc -l | tr -d ' ')"
+  ok_mark() { [ "$1" = 1 ] && printf '✅' || printf '🚧'; }
+  S_OK=0; [ "$STATUS" = READY_TO_EXECUTE ] && S_OK=1
+  Q_OK=0; [ "$OPEN_N" -eq 0 ] && Q_OK=1
+  B_OK=0; [ "$BLOCKS" = yes ] && B_OK=1
+  T_OK=0; [ -z "$SLOW" ] && T_OK=1
+  printf '\n🔎 \e[1mmagic check\e[0m\n\n  📄 plan      %s\n  %s status    %s\n  %s questions %s open\n  %s blocks    %s\n  %s tests     %s\n  🎛️  mode      %s\n  🌿 branch    %s  (base %s)\n  🤖 engine    %s (%s)\n\n' \
+    "$PLAN" "$(ok_mark $S_OK)" "${STATUS:-missing}" "$(ok_mark $Q_OK)" "$OPEN_N" "$(ok_mark $B_OK)" "$BLOCKS" \
+    "$(ok_mark $T_OK)" "${SLOW:+not unit: }${SLOW:-unit only}" "${MODE:-unset}" "$BRANCH" "$BASE" "$ENGINE" "$MODEL"
+  [ "$DEV" -eq 0 ] || printf '  🧪 dev mode  no push, no gh\n\n'
+  if [ "$S_OK$Q_OK$B_OK$T_OK" != 1111 ]; then
+    if [ -n "$OPEN" ]; then
+      printf '🙋 open questions\n%s\n\n' "$OPEN"
+      Q_FILE="$PLAN_DIR/questions.md"; touch "$Q_FILE"
+      printf '%s\n' "$OPEN" | while IFS= read -r q; do   # one line per question, no repeats across reruns
+        grep -qF -- "$q" "$Q_FILE" || printf '%s · check · %s\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$q" >> "$Q_FILE"
+      done
+      say "stored in $Q_FILE"
+    fi
+    beep 0
+    [ -z "$SLOW" ] || say "🧪 Test blocks must be unit specs; move the integration/e2e spec to Done-when"
+    die "not executable; fix with /spec $PLAN, then rerun"
+  fi
+  say "executable, starting"
+}
+
+# Already inside a linked worktree → use it. Otherwise create one.
+if [ "$(git -C "$ROOT" rev-parse --git-common-dir)" != "$(git -C "$ROOT" rev-parse --git-dir)" ]; then
+  WT="$ROOT"
+else
+  WT="$ROOT/.claude/worktrees/$NAME"
+  if [ ! -d "$WT" ]; then
+    say "worktree $WT on $BRANCH"
+    git -C "$ROOT" fetch origin --quiet
+    if git -C "$ROOT" show-ref -q "refs/heads/$BRANCH"; then
+      git -C "$ROOT" worktree add "$WT" "$BRANCH"
+    else
+      git -C "$ROOT" worktree add "$WT" -b "$BRANCH" "origin/$BASE"
+    fi
+    spin "copying ignored files into the worktree"
+    git -C "$ROOT" ls-files --others --ignored --exclude-standard --directory -z |
+      while IFS= read -r -d '' f; do
+        case "$f" in node_modules/|dist/|build/|coverage/|.claude/*|.claude/|debug/|.DS_Store|*.log|.husky/_/) continue;; esac
+        mkdir -p "$WT/$(dirname "$f")"; cp -R "$ROOT/$f" "$WT/$f"
+      done
+    spin_stop; say "📦 installing dependencies"
+    if   [ -f "$WT/pnpm-lock.yaml" ];     then (cd "$WT" && pnpm install --frozen-lockfile)
+    elif [ -f "$WT/yarn.lock" ];          then (cd "$WT" && yarn install --frozen-lockfile)
+    elif [ -f "$WT/package-lock.json" ];  then (cd "$WT" && npm ci)
+    fi
+  fi
+fi
+
+CUR="$(git -C "$WT" branch --show-current)"
+case "$CUR" in main|master|develop) die "worktree is on $CUR; refusing to run";; esac
+
+WT_PLAN_DIR="$WT/.claude/plans/$PLAN_BASE"
+mkdir -p "$WT_PLAN_DIR"
+[ -f "$WT_PLAN_DIR/plan.md" ] || cp -R "$PLAN_DIR/." "$WT_PLAN_DIR/"   # first run only; later runs keep the worktree copy
+REL=".claude/plans/$PLAN_BASE/plan.md"
+LOGS="$WT_PLAN_DIR/magic-logs"; mkdir -p "$LOGS"
+ROWS="$LOGS/rows.tsv"; : > "$ROWS"
+TIMINGS="${MAGIC_HOME:-$HOME/.magic}/$(basename "$ROOT")/$CUR/rows.tsv"; mkdir -p "$(dirname "$TIMINGS")"
+TITLE="$(sed -nE '1s/^# *(Plan: *)?(.*) — .*/\2/p;1s/^# *(Plan: *)?(.*)$/\2/p' "$PLAN" | head -1)"
+PR_PROMPT='Write the pull-request body for this branch to debug/pr.md, nothing else. Sources: `git log` and
+`git diff` against the base branch, and the plan'"'"'s changes.md (requirements served, proofs, the last
+"## Review" section). Use the repo'"'"'s .github/pull_request_template.md when one exists; otherwise:
+line 1 is "# <circle> <type>: <title>", then **TL;DR:** (one sentence, what a caller can now do),
+a Before/After table (one row per observable behavior that changed), **Scope** bullets (In / Out),
+**Changes** (one bullet per technical choice, each with the invariant a reviewer can falsify),
+**How to test** (copy-paste commands with the expected result), **Migration notes** (write "None"
+rather than deleting), and **Automated review**: Status 🟢 Good to merge when the review section
+says "Open: none", else 🟠 Needs work; Source `magic review ('"$ENGINE"')` · date · head sha;
+Model '"$MODEL"'; then the review'"'"'s findings table and the line "Substantially agent-written;
+human merge review requested." The title circle must equal that Status circle. No file-by-file
+walkthrough, no checkboxes, no invented tickets, no "Generated with" footer.'
+PR_TOOLS="Read,Glob,Grep,Write,Bash(git diff*),Bash(git log*),Bash(git rev-parse*)"
+
+emit() {  # one finished tsv row → this run's rows.tsv and the global, append-only timings file
+  printf '%s\n' "$1" >> "$ROWS"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PLAN_BASE" "$ENGINE" "$MODEL" "$1" >> "$TIMINGS"
+}
+row() { emit "$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$@")"; }
+
+done_already() {  # step → 0 when the plan/log already records it
+  local plan="$WT_PLAN_DIR/plan.md" log="$WT_PLAN_DIR/changes.md"
+  [ "$FORCE" -eq 0 ] || return 1
+  case "$1" in
+    build)  [ -f "$log" ] && grep -q '^## Final proof' "$log" ;;
+    test)   [ -f "$log" ] && grep -q '^## Self-check' "$log" ;;
+    docs)   [ -f "$log" ] && grep -q '^## Docs' "$log" ;;
+    review) [ -f "$log" ] && grep -q '^## Review' "$log" ;;
+    *) return 1 ;;
+  esac
+}
+
+run_step() {  # name, prompt [fresh]
+  if done_already "$1"; then echo "   ⏭  skip, already in changes.md"; row "$1" "skip" "already in changes.md" "-" "-" ""; return 0; fi
+  local name="$1" prompt="$2" log="$LOGS/$1.jsonl" t0 rc resume=()
+  if [ "${3:-}" = "fresh" ] || [ -z "$SESSION" ] || { [ "$ENGINE" = claude ] && [ "$CTX" -ge "$CTX_LIMIT" ]; }; then
+    SESSION_N=$((SESSION_N + 1))
+  else
+    resume=(--resume "$SESSION")
+  fi
+  spin "$name"
+  t0=$(date +%s); set +e
+  if [ "$ENGINE" = "claude" ]; then
+    (cd "$WT" && claude -p "$prompt" "${resume[@]}" --model "$MODEL" --allowedTools "${STEP_TOOLS:-$TOOLS}" \
+       --append-system-prompt "$HAMMER" --output-format stream-json --verbose > "$log")
+    rc=$?
+  else
+    local text; text="$(codex_prompt "$prompt")"
+    if [ ${#resume[@]} -gt 0 ]; then
+      (cd "$WT" && codex exec resume "$SESSION" --json -o "$log.last" "$text" > "$log")
+    else
+      (cd "$WT" && codex exec --json -s workspace-write ${CODEX_MODEL:+-m "$CODEX_MODEL"} -o "$log.last" "$text" > "$log")
+    fi
+    rc=$?
+  fi
+  set -e; spin_stop
+  if [ "$ENGINE" = "claude" ]; then
+    VERDICT_LINE="$(tail -n1 "$log" | jq -r '.result // ""' | grep -E '^MAGIC: ' | tail -1 || true)"
+    SESSION="$(tail -n1 "$log" | jq -r '.session_id // ""')"
+    CTX="$(jq -rs '[.[] | select(.type=="assistant") | .message.usage | (.input_tokens + .cache_read_input_tokens + .cache_creation_input_tokens)] | last // 0' "$log")"
+  else
+    VERDICT_LINE="$(grep -E '^MAGIC: ' "$log.last" 2>/dev/null | tail -1 || true)"
+    SESSION="$(jq -rs '[.[] | select(.type=="thread.started") | .thread_id] | last // ""' "$log")"
+    # codex reports input tokens cumulatively over the whole thread, not the live context, and
+    # compacts itself; the figure is shown but never ends a session (see the gate above)
+    CTX="$(jq -rs '[.[] | select(.type=="turn.completed") | .usage.input_tokens] | last // 0' "$log")"
+  fi
+  VERDICT="$(printf '%s' "$VERDICT_LINE" | grep -oE 'MAGIC: (DONE|CONTINUE|IMPOSSIBLE)' | sed 's/MAGIC: //' || true)"
+  emit "$(python3 - "$name" "$log" "$rc" "$(( $(date +%s) - t0 ))" "$SESSION_N" "$CTX" <<'PY'
+import json, sys, os
+name, log, rc, secs, sn, ctx = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
+files, turns, err, cost, tail = set(), 0, False, 0.0, ""
+for line in open(log):
+    try: ev = json.loads(line)
+    except ValueError: continue
+    t = ev.get("type")
+    if t == "item.completed":                      # codex
+        it = ev.get("item", {})
+        if it.get("type") in ("command_execution", "file_change"): turns += 1
+        for ch in it.get("changes", []) or []:
+            if ch.get("path"): files.add(ch["path"])
+        if it.get("type") == "agent_message":
+            lines = [l for l in (it.get("text") or "").splitlines() if l.strip()]
+            if lines: tail = next((l for l in lines if l.startswith("MAGIC:")), lines[0])[:80]
+    elif t == "turn.failed" or t == "error":
+        err = True
+    elif t == "assistant":                         # claude
+        for c in ev["message"].get("content", []):
+            if c.get("type") == "tool_use":
+                p = c["input"].get("file_path") or c["input"].get("path")
+                if c["name"] in ("Edit", "Write", "MultiEdit") and p: files.add(p)
+    elif ev.get("type") == "result":
+        turns, err = ev.get("num_turns", 0), bool(ev.get("is_error"))
+        cost = ev.get("total_cost_usd") or 0.0
+        lines = [l for l in (ev.get("result") or "").splitlines() if l.strip()]
+        tail = next((l for l in lines if l.startswith("MAGIC:")), lines[0] if lines else "")[:80]
+status = "ok" if rc == 0 and not err and "IMPOSSIBLE" not in tail else "FAIL"
+print(f"{name}\t{status}\t{turns} turns · {len(files)} files · ${cost:.2f}\t#{sn} {ctx//1000}K\t{secs//60}m{secs%60:02d}s\t{tail}")
+PY
+)"
+  local ok=1
+  { [ "$rc" -eq 0 ] && ! tail -n1 "$log" | grep -q '"is_error":true'; } || ok=0
+  [ "$VERDICT" != IMPOSSIBLE ] || ok=0
+  local cost=""; [ "$ENGINE" = claude ] && cost="$(step_cost)"
+  printf '   %s %s%s%s\n' "$([ "$ok" -eq 1 ] && printf '✅' || printf '❌')" "$(fmt_t $(( $(date +%s) - t0 )))" "${cost:+  ·  💸 $cost}" "${VERDICT_LINE:+  ·  $VERDICT_LINE}"
+  [ "$ok" -eq 1 ]
+}
+
+codex_prompt() {  # slash command → the skill text codex can't load itself, hammer rules on top
+  local p="$1" files=() args
+  case "$p" in
+    "/execute test "*)   files=("$SKILLS/execute/modes/test/SKILL.md");   args="${p#/execute test }";;
+    "/execute docs "*)   files=("$SKILLS/execute/modes/docs/SKILL.md");   args="${p#/execute docs }";;
+    "/execute review "*) files=("$SKILLS/execute/modes/review/SKILL.md"); args="${p#/execute review }";;
+    "/execute "*)        files=("$SKILLS/execute/modes/build/SKILL.md");  args="${p#/execute }";;
+    *) printf '%s\n\n%s\n' "$HAMMER" "$p"; return;;
+  esac
+  printf '%s\n\nFollow the skill below exactly. Paths in it are relative to %s.\n\n' "$HAMMER" "$(dirname "${files[0]}")"
+  cat "${files[@]}"
+  printf '\n\nArguments: %s\n' "$args"
+}
+
+confirm_loop() {  # same session as build/test/docs; two DONE in a row, a CONTINUE resets the count
+  local done=0 n=0
+  while [ "$done" -lt 2 ]; do
+    n=$((n + 1))
+    if [ "$n" -gt "$MAX_ROUNDS" ]; then echo "   ❌ MAGIC_MAX_ROUNDS=$MAX_ROUNDS reached"; row "confirm-$n" "FAIL" "MAGIC_MAX_ROUNDS=$MAX_ROUNDS reached" "-" "-" ""; return 1; fi
+    stage confirm "$n$([ "$n" -eq 1 ] && printf ', 2 DONE in a row needed')"
+    run_step "confirm-$n" "$CONFIRM Plan: $REL" || return 1
+    case "$VERDICT" in DONE) done=$((done + 1));; *) done=0;; esac
+  done
+}
+
+commit_step() {  # name, message
+  local name="$1" msg="$2" stat
+  git -C "$WT" add -A
+  git -C "$WT" reset -q -- .claude debug
+  if git -C "$WT" diff --cached --quiet; then
+    printf '\n📦 %s  skip, nothing to commit\n' "$name"
+    row "$name" "skip" "nothing to commit" "-" "-" ""
+  else
+    git -C "$WT" commit -q -m "$(printf '%s\n\nCo-Authored-By: Claude <noreply@anthropic.com>' "$msg")"
+    stat="$(git -C "$WT" diff --stat HEAD~1 | tail -1 | sed 's/^ *//')"
+    printf '\n📦 %s  %s  ·  %s\n' "$name" "$(git -C "$WT" rev-parse --short HEAD)" "$stat"
+    row "$name" "ok" "$(git -C "$WT" rev-parse --short HEAD)" "-" "-" "$stat"
+  fi
+}
+
+review_green() {  # last "## Review" section of the log must say "Open: none"
+  awk '/^## Review/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$WT_PLAN_DIR/changes.md" | grep -q '^Open: none'
+}
+
+finish_step() {
+  if [ "$PR" -eq 1 ] && ! review_green; then
+    row "commit-2" "skip" "review not green" "-" "-" "no commit, no PR"; return 1
+  fi
+  commit_step commit-2 "refactor($NAME): apply project standards"
+  [ "$PR" -eq 0 ] || pr_step
+}
+
+pr_body() {  # a plain link connects the PR to the ticket; no Fixes/Closes, so Linear leaves its status alone
+  tail -n +2 "$WT/debug/pr.md"
+  [ -z "$LINEAR_URL" ] || grep -q "$LINEAR_URL" "$WT/debug/pr.md" || printf '\n**Linear:** %s\n' "$LINEAR_URL"
+}
+
+model_label() {
+  case "$ENGINE:$MODEL" in
+    claude:claude-fable-5-1)  echo "Claude Fable 5.1";;
+    claude:claude-opus-5-5)   echo "Claude Opus 5.5";;
+    claude:claude-sonnet-5-5) echo "Claude Sonnet 5.5";;
+    claude:*)                 echo "Claude $MODEL";;
+    codex:*)                  echo "Codex${CODEX_MODEL:+ $CODEX_MODEL}";;
+  esac
+}
+
+pr_comment() {  # pr url → two-line note on the PR
+  local cost; [ "$ENGINE" = claude ] && cost="$(total_cost)" || cost="n/a (Codex)"
+  if (cd "$WT" && gh pr comment "$1" --body "$(printf '✨ Contributed with Magic · %s\n🤖 %s · 💸 %s' \
+       "$(date -u '+%Y-%m-%d %H:%M UTC')" "$(model_label)" "$cost")" >/dev/null 2>&1); then
+    echo "   💬 comment posted"; row "comment" "ok" "posted on PR" "-" "-" ""
+  else
+    echo "   ❌ comment failed"; row "comment" "FAIL" "gh pr comment" "-" "-" ""
+  fi
+}
+
+pr_step() {
+  local existing title
+  stage pr
+  STEP_TOOLS="$PR_TOOLS" run_step pr-body "$PR_PROMPT" || return 1
+  [ -s "$WT/debug/pr.md" ] || { row "pr" "FAIL" "debug/pr.md not written" "-" "-" ""; return 1; }
+  title="$(sed -n '1s/^# *//p' "$WT/debug/pr.md")"
+  case "$title" in 🟢*) ;; *) echo "   ⏭  title not green: $title"; row "pr" "skip" "title not green: $title" "-" "-" ""; return 1;; esac
+  if [ "$DEV" -eq 1 ]; then
+    echo "   🧪 dev: would push $CUR and open a draft PR on $BASE · $title · body debug/pr.md"
+    row "pr" "skip" "dev mode: no push, no gh" "-" "-" "$title"; return 0
+  fi
+  spin "push + draft PR"
+  git -C "$WT" push -u origin "$CUR" --quiet
+  existing="$(cd "$WT" && gh pr list --head "$CUR" --json url --jq '.[0].url // ""')"
+  if [ -n "$existing" ]; then
+    (cd "$WT" && gh pr edit "$existing" --title "$title" --body-file <(pr_body) >/dev/null)
+  else
+    existing="$(cd "$WT" && gh pr create --draft --base "$BASE" --title "$title" --body-file <(pr_body))"
+    spin_stop; echo "   ✅ draft · base $BASE  ·  $existing"
+    row "pr" "ok" "draft · base $BASE" "-" "-" "$existing"
+    pr_comment "$existing"
+    return 0
+  fi
+  spin_stop; echo "   ✅ draft · base $BASE (edited)  ·  $existing"
+  row "pr" "ok" "draft · base $BASE (edited)" "-" "-" "$existing"
+}
+
+OK=1
+{ stage build  && run_step build  "/execute $REL"        &&
+  stage test   && run_step test   "/execute test $REL"   &&
+  stage docs   && run_step docs   "/execute docs $REL"   &&
+  confirm_loop                                           &&
+  commit_step commit-1 "$TYPE($NAME): $TITLE"            &&
+  stage review && run_step review "/execute review $REL" fresh &&
+  finish_step; } || OK=0
+TOTAL_COST="$([ "$ENGINE" = claude ] && total_cost || echo "n/a")"
+
+beep "$OK"
+
+python3 - "$ROWS" "$WT_PLAN_DIR/magic-run.md" "$WT" "$CUR" "$OK" "$MODEL" "$ENGINE" "$TOTAL_COST" "$TIMINGS" <<'PY'
+import sys, datetime
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if l.strip()]
+out, wt, branch, ok, model, engine, total, timings = sys.argv[2:10]
+hdr = ["step", "status", "detail", "session ctx", "time", "verdict"]
+N = len(hdr)
+import unicodedata
+mark = {"ok": "✅ ok", "FAIL": "❌ FAIL", "skip": "⏭  skip"}
+for r in rows: r[1] = mark.get(r[1], r[1])
+vw = lambda t: sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in t)
+pad = lambda t, n: t + " " * (n - vw(t))
+w = [max(vw(r[i]) for r in rows + [hdr]) for i in range(N)]
+line = lambda r: "│ " + " │ ".join(pad(r[i], w[i]) for i in range(N)) + " │"
+bar = lambda l, m, r: l + m.join("─" * (x + 2) for x in w) + r
+col = {mark["ok"]: "\033[32m", mark["FAIL"]: "\033[31m", mark["skip"]: "\033[33m"}
+print(); print(bar("┌", "┬", "┐")); print(line(hdr)); print(bar("├", "┼", "┤"))
+for r in rows:
+    print(col.get(r[1], "") + line(r) + "\033[0m")
+print(bar("└", "┴", "┘"))
+print(f"\n{'🎉 done' if ok == '1' else '🛑 stopped'}  ·  💸 {total}  ·  🌳 {wt}  ·  🌿 {branch}  ·  🤖 {model}\n")
+with open(out, "w") as f:
+    f.write(f"# magic run ({engine}) — {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M} UTC\n\n")
+    f.write(f"Worktree: `{wt}` · Branch: `{branch}` · Engine: `{engine}` · Model: `{model}` · Cost: {total} · Result: {'done' if ok == '1' else 'stopped'}\n\n")
+    f.write("| " + " | ".join(hdr) + " |\n|" + "---|" * N + "\n")
+    for r in rows: f.write("| " + " | ".join(r) + " |\n")
+    f.write(f"\nLogs: `magic-logs/*.jsonl` · Details: `changes.md` · Timings: `{timings}`\n")
+PY
+[ "$OK" -eq 1 ]
+}
+
+main "$@"

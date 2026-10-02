@@ -1,0 +1,27 @@
+{
+  "name": "@anupam-io/magic",
+  "version": "0.1.0",
+  "description": "Plan to code: checks an execution-ready spec, then builds, tests, documents, reviews, and opens the PR headlessly inside a git worktree.",
+  "license": "MIT",
+  "repository": "github:anupam-io/magic",
+  "bin": {
+    "magic": "bin/magic",
+    "magic-claude": "bin/magic-claude",
+    "magic-codex": "bin/magic-codex"
+  },
+  "files": [
+    "bin",
+    "skills"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "claude-code",
+    "codex",
+    "agent",
+    "spec",
+    "cli"
+  ]
+}
