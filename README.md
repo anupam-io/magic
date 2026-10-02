@@ -1,5 +1,7 @@
 # magic
 
+Site: https://anupam-io.github.io/magic/
+
 Spec to finished code, headless. `magic` takes an execution-ready plan, opens a
 git worktree, and runs a coding agent through build, test, docs, two confirm
 passes, review, and a draft PR. The only human gate is the plan check at the
